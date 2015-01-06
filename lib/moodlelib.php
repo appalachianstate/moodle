@@ -5088,73 +5088,110 @@ function remove_course_contents($courseid, $showfeedback = true, array $options 
         echo $OUTPUT->notification($strdeleted.get_string('type_block_plural', 'plugin'), 'notifysuccess');
     }
 
-    // Delete every instance of every module,
-    // this has to be done before deleting of course level stuff.
-    $locations = core_component::get_plugin_list('mod');
-    foreach ($locations as $modname => $moddir) {
-        if ($modname === 'NEWMODULE') {
-            continue;
-        }
-        if ($module = $DB->get_record('modules', array('name' => $modname))) {
-            include_once("$moddir/lib.php");                 // Shows php warning only if plugin defective.
-            $moddelete = $modname .'_delete_instance';       // Delete everything connected to an instance.
-            $moddeletecourse = $modname .'_delete_course';   // Delete other stray stuff (uncommon).
+    // Remove all data from availability and completion tables
+    // associated with course-modules belonging to this course.
+    // Note this is done even if the features are not enabled
+    // now, in case they were enabled previously.
+    $DB->delete_records_select(
+        'course_modules_completion',
+        'coursemoduleid IN (SELECT id from {course_modules} WHERE course = ?)',
+        array($courseid));
 
-            if ($instances = $DB->get_records($modname, array('course' => $course->id))) {
-                foreach ($instances as $instance) {
-                    if ($cm = get_coursemodule_from_instance($modname, $instance->id, $course->id)) {
-                        // Delete activity context questions and question categories.
-                        question_delete_activity($cm,  $showfeedback);
-                    }
-                    if (function_exists($moddelete)) {
-                        // This purges all module data in related tables, extra user prefs, settings, etc.
-                        $moddelete($instance->id);
-                    } else {
-                        // NOTE: we should not allow installation of modules with missing delete support!
-                        debugging("Defective module '$modname' detected when deleting course contents: missing function $moddelete()!");
-                        $DB->delete_records($modname, array('id' => $instance->id));
-                    }
+    // Iterate over the list of course modules, and for
+    // each, call the associated plugin's function to
+    // delete the instance, then delete the course module
+    // entry. After the last course module for a given
+    // plugin is removed, call the plugin's function to
+    // notify it of course deletion.
+    $installedmods  = core_component::get_plugin_list('mod');
+    $modulename     =
+    $delmodinstance =
+    $delmodcourse   = '';
+    $modinstalled   = false;
 
-                    if ($cm) {
-                        // Delete cm and its context - orphaned contexts are purged in cron in case of any race condition.
-                        context_helper::delete_instance(CONTEXT_MODULE, $cm->id);
-                        $DB->delete_records('course_modules', array('id' => $cm->id));
-                    }
+    // Get the course modules for this course, sorted
+    // by module name.
+    $coursemods = $DB->get_records_sql(
+        "SELECT cm.*, m.name
+           FROM {course_modules} cm
+           JOIN {modules} m ON cm.module = m.id
+          WHERE cm.course = :courseid ORDER BY m.name",
+        array('courseid' => $courseid));
+
+    foreach ($coursemods as $cm) {
+
+        // Looking at a different module since last loop iteration?
+        if ($modulename != $cm->name) {
+
+            // Before setting up for the next module, call current
+            // module's course delete routine, if it exists.
+            if ($modinstalled && function_exists($delmodcourse)) {
+                $delmodcourse($course, $showfeedback);
+            }
+
+            // Indicate finished with the current module.
+            if ($modinstalled && $showfeedback) {
+                echo $OUTPUT->notification($strdeleted . get_string('pluginname', $modulename), 'notifysuccess');
+            }
+
+            $modulename = $cm->name;
+
+            // Set up for the next module if it is valid.
+            if (array_key_exists($modulename, $installedmods)) {
+                $modinstalled   = true;
+                $delmodinstance = $modulename . '_delete_instance';
+                $delmodcourse   = $modulename . '_delete_course';
+                include_once("{$installedmods[$modulename]}/lib.php");
+            } else {
+                // This mod doesn't appear in the list of installed
+                // mods, so don't call any of its library functions
+                // even though the code might still be on disk.
+                $modinstalled   = false;
+                $delmodinstance =
+                $delmodcourse   = '';
+            }
+
+        } // if ($modulename != $cm->name)
+
+        // Delete activity context questions and question categories.
+        question_delete_activity($cm, $showfeedback);
+
+        if ($modinstalled) {
+            // If module supplies method to delete instance, call it.
+            if (function_exists($delmodinstance)) {
+                $delmodinstance($cm->instance);
+            } else {
+                // Otherwise, indicate module does not provide an
+                // expected callback method, and attempt to directly
+                // remove rows using expected names for table/column
+                // squelching any resulting exceptions (e.g. table
+                // not found).
+                debugging("Defective module '{$modulename}' detected when deleting course contents: missing function {$delmodinstance}()!");
+                try {
+                    $DB->delete_records($modulename, array('id' => $cm->instance));
+                }
+                catch (Exception $e) {
+                    // Squelch exception, likely table not found or
+                    // column name invalid.
                 }
             }
-            if (function_exists($moddeletecourse)) {
-                // Execute ptional course cleanup callback.
-                $moddeletecourse($course, $showfeedback);
-            }
-            if ($instances and $showfeedback) {
-                echo $OUTPUT->notification($strdeleted.get_string('pluginname', $modname), 'notifysuccess');
-            }
-        } else {
-            // Ooops, this module is not properly installed, force-delete it in the next block.
         }
-    }
 
-    // We have tried to delete everything the nice way - now let's force-delete any remaining module data.
-
-    // Remove all data from availability and completion tables that is associated
-    // with course-modules belonging to this course. Note this is done even if the
-    // features are not enabled now, in case they were enabled previously.
-    $DB->delete_records_select('course_modules_completion',
-           'coursemoduleid IN (SELECT id from {course_modules} WHERE course=?)',
-           array($courseid));
-
-    // Remove course-module data.
-    $cms = $DB->get_records('course_modules', array('course' => $course->id));
-    foreach ($cms as $cm) {
-        if ($module = $DB->get_record('modules', array('id' => $cm->module))) {
-            try {
-                $DB->delete_records($module->name, array('id' => $cm->instance));
-            } catch (Exception $e) {
-                // Ignore weird or missing table problems.
-            }
-        }
+        // Remove the course module row and its context, regardless of
+        // whether the module appears to be installed.
         context_helper::delete_instance(CONTEXT_MODULE, $cm->id);
         $DB->delete_records('course_modules', array('id' => $cm->id));
+
+    } // foreach $cm
+
+    // Call last module's course delete routine.
+    if ($modinstalled && function_exists($delmodcourse)) {
+        $delmodcourse($course, $showfeedback);
+    }
+
+    // Indicate finished with the last module.
+    if ($modinstalled && $showfeedback) {
+        echo $OUTPUT->notification($strdeleted . get_string('pluginname', $modulename), 'notifysuccess');
     }
 
     if ($showfeedback) {
