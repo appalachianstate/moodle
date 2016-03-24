@@ -4826,15 +4826,91 @@ class admin_setting_special_backup_auto_destination extends admin_setting_config
      * @return string Empty when no errors.
      */
     public function write_setting($data) {
+        global $CFG;
+
+
         $storage = (int) get_config('backup', 'backup_auto_storage');
-        if ($storage !== 0) {
-            if (empty($data) || !file_exists($data) || !is_dir($data) || !is_writable($data) ) {
+        if ($storage === 0) {
+            // Course backup file area, clear this field
+            $data = null;
+        } elseif ($storage === 1 || $storage === 2) {
+            // External location, or course backup file area plus
+            // external location. Validate a value provided, and
+            // either is valid dir or S3 bucket
+            if (empty($data)) {
+                // Must specify something here.
+                return get_string('backuperrorinvaliddestination');
+            } elseif (stripos($data, 's3://') === 0) {
+                $temparr  = explode('//', $data, 2);
+                $s3path   = array_pop($temparr);
+                $temparr  = explode('/', $s3path);
+                $s3bucket = array_shift($temparr);
+                if (empty($s3bucket)) {
+                    return get_string('backuperrorinvaliddestination');
+                }
+                require_once("{$CFG->libdir}/vendor/autoload.php");
+                $s3client = Aws\S3\S3Client::factory($CFG->aws_config);
+                if (!$s3client->doesBucketExist($s3bucket)) {
+                    return get_string('backuperrorinvaliddestination');
+                }
+            } elseif (!file_exists($data) || !is_dir($data) || !is_writable($data)) {
                 // The directory must exist and be writable.
                 return get_string('backuperrorinvaliddestination');
             }
         }
+
         return parent::write_setting($data);
+
     }
+
+    /**
+     * Returns an XHTML field
+     *
+     * @param string $data This is the value for the field
+     * @param string $query
+     * @return string XHTML
+     */
+    public function output_html($data, $query='') {
+        global $CFG;
+
+
+        $default = $this->get_defaultsetting();
+
+        if (empty($data)) {
+            $executable = '';
+        } elseif (stripos($data, 's3://') === 0) {
+            $temparr  = explode('//', $data, 2);
+            $s3path   = array_pop($temparr);
+            $temparr  = explode('/', $s3path);
+            $s3bucket = array_shift($temparr);
+            if (empty($s3bucket)) {
+                $executable = '<span class="patherror">&#x2718;</span>';
+            } else {
+                require_once("{$CFG->libdir}/vendor/autoload.php");
+                $s3client = Aws\S3\S3Client::factory($CFG->aws_config);
+                if (!$s3client->doesBucketExist($s3bucket)) {
+                    $executable = '<span class="patherror">&#x2718;</span>';
+                } else {
+                    $executable = '<span class="pathok">&#x2714;</span>';
+                }
+            }
+        } elseif (file_exists($data) && is_dir($data)) {
+            $executable = '<span class="pathok">&#x2714;</span>';
+        } else {
+            $executable = '<span class="patherror">&#x2718;</span>';
+        }
+
+        $readonly = '';
+        if (!empty($CFG->preventexecpath)) {
+            $this->visiblename .= '<div class="form-overridden">'.get_string('execpathnotallowed', 'admin').'</div>';
+            $readonly = 'readonly="readonly"';
+        }
+
+        return format_admin_setting($this, $this->visiblename,
+            '<div class="form-file defaultsnext"><input '.$readonly.' type="text" size="'.$this->size.'" id="'.$this->get_id().'" name="'.$this->get_full_name().'" value="'.s($data).'" />'.$executable.'</div>',
+            $this->description, true, '', $default, $query);
+    }
+
 }
 
 

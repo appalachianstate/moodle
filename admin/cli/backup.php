@@ -68,9 +68,24 @@ if (!$admin) {
 }
 
 // Do we need to store backup somewhere else?
-$dir = rtrim($options['destination'], '/');
-if (!empty($dir)) {
-    if (!file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
+// If supplied, validate it
+$s3path = $s3bucket = '';
+$destination = rtrim($options['destination'], '/');
+if (!empty($destination)) {
+    if (stripos($destination, 's3://') === 0) {
+        $s3path = array_pop(explode('//', $destination, 2));
+        $s3bucket = array_shift(explode('/', $s3path));
+        if (empty($s3bucket)) {
+            mtrace(get_string('backuperrorinvaliddestination'));
+            die;
+        }
+        require_once("{$CFG->libdir}/vendor/autoload.php");
+        $s3client = Aws\S3\S3Client::factory($CFG->aws_config);
+        if (!$s3client->doesBucketExist($s3bucket)) {
+            mtrace(get_string('backuperrorinvaliddestination'));
+            die;
+        }
+    } elseif (!file_exists($destination) || !is_dir($destination) || !is_writable($destination)) {
         mtrace("Destination directory does not exists or not writable.");
         die;
     }
@@ -98,14 +113,47 @@ $bc->get_plan()->get_setting('filename')->set_value($filename);
 // Execution.
 $bc->finish_ui();
 $bc->execute_plan();
+
+// Get the stored_file object produced and returned
+// via the backup results
 $results = $bc->get_results();
-$file = $results['backup_destination']; // May be empty if file already moved to target location.
+$file = $results['backup_destination'];
 
 // Do we need to store backup somewhere else?
-if (!empty($dir)) {
+if (!empty($s3bucket)) {
+
+    $s3folder = (strpos($s3path, '/') === false ? '' : rtrim(array_pop(explode('/', $s3path, 2)), '/'));
+    $fh = null;
+    try {
+        $fh = $file->get_content_file_handle(stored_file::FILE_HANDLE_FOPEN);
+        $s3result = $s3client->putObject(array(
+            'Bucket'    => $s3bucket,
+            'Key'       => (empty($s3folder) ? '' : "{$s3folder}/") . "{$filename}",
+            'Body'      => $fh,
+            'Metadata'  => array(
+                'moodle-course-id'      => "{$course->id}",
+                'moodle-backup-id'      => "{$bc->get_backupid()}",
+                'moodle-backup-type'    => "{$bc->get_type()}",
+                'moodle-backup-mode'    => "{$bc->get_mode()}")));
+        fclose($fh);
+    } catch (Exception $exc) {
+        mtrace("Execution of backup plan threw exception: " . $exc->getMessage());
+        if ($fh != null) { fclose($fh); }
+        die;
+    }
+
+    $s3status = $s3result['@metadata']['statusCode'];
+    if ($s3status == 200) {
+        mtrace("load backup to S3 bucket succeeded");
+    } else {
+        mtrace("load backup to S3 bucket failed: {$s3status}");
+    }
+
+}
+elseif (!empty($destination)) {
     if ($file) {
-        mtrace("Writing " . $dir.'/'.$filename);
-        if ($file->copy_content_to($dir.'/'.$filename)) {
+        mtrace("Writing " . $destination.'/'.$filename);
+        if ($file->copy_content_to($destination.'/'.$filename)) {
             $file->delete();
             mtrace("Backup completed.");
         } else {

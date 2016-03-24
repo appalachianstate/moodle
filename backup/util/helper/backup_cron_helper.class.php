@@ -389,54 +389,12 @@ abstract class backup_cron_automated_helper {
             $bc->execute_plan();
             $results = $bc->get_results();
             $outcome = self::outcome_from_results($results);
-            $file = $results['backup_destination']; // May be empty if file already moved to target location.
-
-            // If we need to copy the backup file to an external dir and it is not writable, change status to error.
-            // This is a feature to prevent moodledata to be filled up and break a site when the admin misconfigured
-            // the automated backups storage type and destination directory.
-            if ($storage !== 0 && (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir))) {
-                $bc->log('Specified backup directory is not writable - ', backup::LOG_ERROR, $dir);
-                $dir = null;
-                $outcome = self::BACKUP_STATUS_ERROR;
-            }
-
-            // Copy file only if there was no error.
-            if ($file && !empty($dir) && $storage !== 0 && $outcome != self::BACKUP_STATUS_ERROR) {
-                $filename = backup_plan_dbops::get_default_backup_filename($format, $type, $course->id, $users, $anonymised,
-                        !$config->backup_shortname);
-                if (!$file->copy_content_to($dir.'/'.$filename)) {
-                    $bc->log('Attempt to copy backup file to the specified directory failed - ',
-                            backup::LOG_ERROR, $dir);
-                    $outcome = self::BACKUP_STATUS_ERROR;
-                }
-                if ($outcome != self::BACKUP_STATUS_ERROR && $storage === 1) {
-                    if (!$file->delete()) {
-                        $outcome = self::BACKUP_STATUS_WARNING;
-                        $bc->log('Attempt to delete the backup file from course automated backup area failed - ',
-                                backup::LOG_WARNING, $file->get_filename());
-                    }
-                }
-            }
 
         } catch (moodle_exception $e) {
             $bc->log('backup_auto_failed_on_course', backup::LOG_ERROR, $course->shortname); // Log error header.
             $bc->log('Exception: ' . $e->errorcode, backup::LOG_ERROR, $e->a, 1); // Log original exception problem.
             $bc->log('Debug: ' . $e->debuginfo, backup::LOG_DEBUG, null, 1); // Log original debug information.
             $outcome = self::BACKUP_STATUS_ERROR;
-        }
-
-        // Delete the backup file immediately if something went wrong.
-        if ($outcome === self::BACKUP_STATUS_ERROR) {
-
-            // Delete the file from file area if exists.
-            if (!empty($file)) {
-                $file->delete();
-            }
-
-            // Delete file from external storage if exists.
-            if ($storage !== 0 && !empty($filename) && file_exists($dir.'/'.$filename)) {
-                @unlink($dir.'/'.$filename);
-            }
         }
 
         $bc->destroy();
@@ -575,7 +533,7 @@ abstract class backup_cron_automated_helper {
         // Clean up excess backups in the specified external directory.
         $deleteddirectorybackups = false;
         if ($storage == self::STORAGE_DIRECTORY || $storage == self::STORAGE_COURSE_AND_DIRECTORY) {
-            $deleteddirectorybackups = self::remove_excess_backups_from_directory($course, $now);
+            $deleteddirectorybackups = self::remove_excess_backups_from_external($course, $now, $config);
         }
 
         if ($deletedcoursebackups || $deleteddirectorybackups) {
@@ -618,14 +576,36 @@ abstract class backup_cron_automated_helper {
     }
 
     /**
+     * Removes excess backups from external location
+     *
+     * @param stdClass $course Course object
+     * @param int $now Starting time of the process
+     * @return bool Whether or not backups are being removed
+     */
+    protected static function remove_excess_backups_from_external($course, $now, $config) {
+
+        $externdest = $config->backup_auto_destination;
+
+        if (empty($externdest)) {
+            mtrace('Error: external location configuration value missing');
+            return false;
+        } elseif (stripos($externdest, 's3://') === 0) {
+            return self::remove_excess_backups_from_s3($course, $now, $config);
+        } else {
+            return self::remove_excess_backups_from_directory($course, $now, $config);
+        }
+
+    }
+
+    /**
      * Removes excess backups in the specified external directory from a specified course.
      *
      * @param stdClass $course Course object
      * @param int $now Starting time of the process
      * @return bool Whether or not backups are being removed
      */
-    protected static function remove_excess_backups_from_directory($course, $now) {
-        $config = get_config('backup');
+    protected static function remove_excess_backups_from_directory($course, $now, $config) {
+
         $dir = $config->backup_auto_destination;
 
         $isnotvaliddir = !file_exists($dir) || !is_dir($dir) || !is_writable($dir);
@@ -657,11 +637,11 @@ abstract class backup_cron_automated_helper {
 
             // Make sure this backup concerns the course and site we are looking for.
             if ($bcinfo->format === backup::FORMAT_MOODLE &&
-                    $bcinfo->type === backup::TYPE_1COURSE &&
-                    $bcinfo->original_course_id == $course->id &&
-                    backup_general_helper::backup_is_samesite($bcinfo)) {
-                $backupfiles[$bcinfo->backup_date] = $backupfile;
-            }
+                $bcinfo->type === backup::TYPE_1COURSE &&
+                $bcinfo->original_course_id == $course->id &&
+                backup_general_helper::backup_is_samesite($bcinfo)) {
+                    $backupfiles[$bcinfo->backup_date] = $backupfile;
+                }
         }
 
         $backupstodelete = self::get_backups_to_delete($backupfiles, $now);
@@ -674,6 +654,108 @@ abstract class backup_cron_automated_helper {
         } else {
             return false;
         }
+    }
+
+    /**
+     * Removes excess backups in the specified external directory from a specified course.
+     *
+     * @param stdClass $course Course object
+     * @param int $now Starting time of the process
+     * @return bool Whether or not backups are being removed
+     */
+    protected static function remove_excess_backups_from_s3($course, $now, $config) {
+        global $CFG;
+
+
+        // Get the S3 bucket name and folder
+        $s3url = $config->backup_auto_destination;
+
+        // Strip off the leading s3://
+        $temparray      = explode('//', $s3url, 2);
+        $s3bucketpath   = array_pop($temparray);
+        // Parse to get the bucket name only,
+        // everything up to the first slash
+        $temparray      = explode('/', $s3bucketpath);
+        $s3bucketname = array_shift($temparray);
+        if (empty($s3bucketname)) {
+            // Misconfigured, stop everything until corrected
+            mtrace('Error: external S3 destination misconfigured');
+            return false;
+        }
+
+        // Parse to get the folder name only,
+        // everything after the first slash
+        $s3folder = '';
+        if (strpos($s3bucketpath, '/') !== false) {
+            $temparray  = explode('/', $s3bucketpath, 2);
+            $s3folder   = rtrim(array_pop($temparray), '/');
+            if (!empty($s3folder)) {
+                $s3folder .= '/';
+            }
+        }
+
+
+        require_once("{$CFG->libdir}/vendor/autoload.php");
+        $s3client = Aws\S3\S3Client::factory($CFG->aws_config);
+
+        if (!$s3client->doesBucketExist($s3bucketname)) {
+            mtrace('Error: ' . $s3bucketname . ' does not appear to be a valid S3 bucket name');
+            return false;
+        }
+
+        $iterator = $s3client->getIterator('ListObjects', array(
+            'Bucket' => $s3bucketname,
+            'Prefix' => $s3folder . "backup-" . backup::FORMAT_MOODLE . '-' . backup::TYPE_1COURSE . "-{$course->id}-"));
+
+        $backupsforcourse = array();
+        foreach($iterator as $s3object) {
+
+            // Have a list of S3 objects for which we
+            // need the metadata, so fetch head info
+            $head = $s3client->headObject(array(
+                'Bucket'    => $s3bucketname,
+                'Key'       => $s3object['Key']
+            ));
+
+            // Examine the metadata to see if is a match
+            // for the course we are concerned with
+            $s3metadata = $head->get('Metadata');
+            if (   empty($s3metadata['moodle-course-id'])   || $s3metadata['moodle-course-id']   != $course->id
+                || empty($s3metadata['moodle-backup-type']) || $s3metadata['moodle-backup-type'] != backup::TYPE_1COURSE
+                || empty($s3metadata['moodle-backup-mode']) || $s3metadata['moodle-backup-mode'] != backup::MODE_AUTOMATED
+                || empty($s3metadata['moodle-backup-site']) || $s3metadata['moodle-backup-site'] != md5(get_site_identifier())
+                || empty($s3metadata['moodle-backup-date'])) {
+                continue;
+            }
+
+            $backupsforcourse[$s3metadata['moodle-backup-date']] = $s3object['Key'];
+
+        }
+
+        // From those backup files found to be for this
+        // course, see which ones should be removed based
+        // on the configs and current date
+        if (false === ($backupstodelete = self::get_backups_to_delete($backupsforcourse, $now))) {
+            return false;
+        }
+
+        // Try to remove the backups from the bucket
+        $removedcount = 0;
+        foreach ($backupstodelete as $backuptodelete) {
+            $s3result = $s3client->deleteObject(array(
+                'Bucket'    => $s3bucketname,
+                'Key'       => $backuptodelete
+            ));
+            if ($s3result['@metadata']['statusCode'] != 200) {
+                mtrace("Error: deleteObject for {$s3bucketname}/{$backuptodelete} returned status {$s3result['@metadata']['statusCode']}");
+            } else {
+                $removedcount++;
+            }
+        }
+
+        mtrace('Deleted ' . $removedcount . ' old backup file(s) from external directory');
+        return ($removedcount > 0);
+
     }
 
     /**

@@ -215,142 +215,191 @@ abstract class backup_helper {
      * @param \core\progress\base $progress Optional progress monitor
      * @return stored_file if created, null otherwise
      *
-     * @throws moodle_exception in case of any problems
+     * @throws backup_helper_exception
      */
     static public function store_backup_file($backupid, $filepath, \core\progress\base $progress = null) {
         global $CFG;
 
-        // First of all, get some information from the backup_controller to help us decide
-        list($dinfo, $cinfo, $sinfo) = backup_controller_dbops::get_moodle_backup_information(
-                $backupid, $progress);
 
-        // Extract useful information to decide
-        $hasusers  = (bool)$sinfo['users']->value;     // Backup has users
-        $isannon   = (bool)$sinfo['anonymize']->value; // Backup is anonymised
-        $filename  = $sinfo['filename']->value;        // Backup filename
-        $backupmode= $dinfo[0]->mode;                  // Backup mode backup::MODE_GENERAL/IMPORT/HUB
-        $backuptype= $dinfo[0]->type;                  // Backup type backup::TYPE_1ACTIVITY/SECTION/COURSE
-        $userid    = $dinfo[0]->userid;                // User->id executing the backup
-        $id        = $dinfo[0]->id;                    // Id of activity/section/course (depends of type)
-        $courseid  = $dinfo[0]->courseid;              // Id of the course
-        $format    = $dinfo[0]->format;                // Type of backup file
+        // Before leaving this routine, want to make sure
+        // the backup file in the temp dir is removed, so
+        // wrap up in try/catch,
+        try
+        {
 
-        // Quick hack. If for any reason, filename is blank, fix it here.
-        // TODO: This hack will be out once MDL-22142 - P26 gets fixed
-        if (empty($filename)) {
-            $filename = backup_plan_dbops::get_default_backup_filename('moodle2', $backuptype, $id, $hasusers, $isannon);
-        }
+            // First of all, get some information from the backup_controller to help us decide
+            list($detailinfo, $courseinfo, $settinginfo) = backup_controller_dbops::get_moodle_backup_information($backupid, $progress);
 
-        // Backups of type IMPORT aren't stored ever
-        if ($backupmode == backup::MODE_IMPORT) {
-            return null;
-        }
+            // Extract useful information to decide
+            $hasusers   = (bool)$settinginfo['users']->value;       // Backup has users
+            $isannon    = (bool)$settinginfo['anonymize']->value;   // Backup is anonymised
+            $filename   = $settinginfo['filename']->value;          // Backup filename
 
-        if (!is_readable($filepath)) {
-            // we have a problem if zip file does not exist
-            throw new coding_exception('backup_helper::store_backup_file() expects valid $filepath parameter');
+            $backupmode = $detailinfo[0]->mode;                     // Backup mode backup::MODE_GENERAL/IMPORT/HUB
+            $backuptype = $detailinfo[0]->type;                     // Backup type backup::TYPE_1ACTIVITY/SECTION/COURSE
+            $userid     = $detailinfo[0]->userid;                   // User->id executing the backup
+            $id         = $detailinfo[0]->id;                       // Id of activity/section/course (depends of type)
+            $courseid   = $detailinfo[0]->courseid;                 // Id of the course
+            $format     = $detailinfo[0]->format;                   // Type of backup file
 
-        }
 
-        // Calculate file storage options of id being backup
-        $ctxid     = 0;
-        $filearea  = '';
-        $component = '';
-        $itemid    = 0;
-        switch ($backuptype) {
-            case backup::TYPE_1ACTIVITY:
-                $ctxid     = context_module::instance($id)->id;
-                $component = 'backup';
-                $filearea  = 'activity';
-                $itemid    = 0;
-                break;
-            case backup::TYPE_1SECTION:
-                $ctxid     = context_course::instance($courseid)->id;
-                $component = 'backup';
-                $filearea  = 'section';
-                $itemid    = $id;
-                break;
-            case backup::TYPE_1COURSE:
-                $ctxid     = context_course::instance($courseid)->id;
-                $component = 'backup';
-                $filearea  = 'course';
-                $itemid    = 0;
-                break;
-        }
-
-        if ($backupmode == backup::MODE_AUTOMATED) {
-            // Automated backups have there own special area!
-            $filearea  = 'automated';
-
-            // If we're keeping the backup only in a chosen path, just move it there now
-            // this saves copying from filepool to here later and filling trashdir.
-            $config = get_config('backup');
-            $dir = $config->backup_auto_destination;
-            if ($config->backup_auto_storage == 1 and $dir and is_dir($dir) and is_writable($dir)) {
-                $filedest = $dir.'/'.backup_plan_dbops::get_default_backup_filename($format, $backuptype, $courseid, $hasusers, $isannon, !$config->backup_shortname);
-                // first try to move the file, if it is not possible copy and delete instead
-                if (@rename($filepath, $filedest)) {
-                    return null;
-                }
-                umask($CFG->umaskpermissions);
-                if (copy($filepath, $filedest)) {
-                    @chmod($filedest, $CFG->filepermissions); // may fail because the permissions may not make sense outside of dataroot
-                    unlink($filepath);
-                    return null;
-                } else {
-                    $bc = backup_controller::load_controller($backupid);
-                    $bc->log('Attempt to copy backup file to the specified directory using filesystem failed - ',
-                            backup::LOG_WARNING, $dir);
-                    $bc->destroy();
-                }
-                // bad luck, try to deal with the file the old way - keep backup in file area if we can not copy to ext system
+            // Backups of type IMPORT aren't stored ever
+            // and in this case do not remove the backup
+            // file in the temp dir
+            if ($backupmode == backup::MODE_IMPORT) {
+                return null;
             }
-        }
 
-        // Backups of type HUB (by definition never have user info)
-        // are sent to user's "user_tohub" file area. The upload process
-        // will be responsible for cleaning that filearea once finished
-        if ($backupmode == backup::MODE_HUB) {
-            $ctxid     = context_user::instance($userid)->id;
-            $component = 'user';
-            $filearea  = 'tohub';
+            // Will need a filename to add file to filedir
+            if (empty($filename)) {
+                throw new backup_helper_exception('backup_helper::store_backup_file() expects valid $filename settings info.');
+            }
+
+            // Problem if zip file does not exist
+            if (!is_readable($filepath)) {
+                throw new backup_helper_exception('backup_helper::store_backup_file() expects valid $filepath parameter');
+
+            }
+
+
+            // Defaults for the file record
+            $component = 'backup';
+            $ctxid     = 0;
+            $filearea  = '';
             $itemid    = 0;
+
+            // Adjustments based on $backuptype value
+            switch ($backuptype) {
+                case backup::TYPE_1ACTIVITY:
+                    $ctxid     = context_module::instance($id)->id;
+                    $filearea  = 'activity';
+                    break;
+                case backup::TYPE_1SECTION:
+                    $ctxid     = context_course::instance($courseid)->id;
+                    $filearea  = 'section';
+                    $itemid    = $id;
+                    break;
+                case backup::TYPE_1COURSE:
+                    $ctxid     = context_course::instance($courseid)->id;
+                    $filearea  = 'course';
+                    break;
+            }
+
+
+            // Adjustments based on the $backupmode value
+            if ($backupmode == backup::MODE_HUB) {
+
+                // Backups of type HUB (by definition never have user info)
+                // are sent to user's "user_tohub" file area. The upload process
+                // will be responsible for cleaning that filearea once finished
+                $ctxid     = context_user::instance($userid)->id;
+                $component = 'user';
+                $filearea  = 'tohub';
+                $itemid    = 0;
+
+            } elseif ($backupmode == backup::MODE_GENERAL && (!$hasusers || $isannon)) {
+
+                // Backups without user info or with the anonymise functionality
+                // enabled are sent to user's "user_backup"
+                // file area. Maintenance of such area is responsibility of
+                // the user via corresponding file manager frontend
+                $ctxid     = context_user::instance($userid)->id;
+                $component = 'user';
+                $filearea  = 'backup';
+                $itemid    = 0;
+
+            } elseif ($backupmode == backup::MODE_AUTOMATED) {
+
+                // Automated backups have there own special area!
+                $filearea  = 'automated';
+
+                // Check if backup file should be copied to an
+                // external destination.
+                $config = get_config('backup');
+                if ($config->backup_auto_storage != 0) {
+
+                    $externdest = $config->backup_auto_destination;
+                    if (empty($externdest)) {
+                        throw new backup_helper_exception('backup_helper::store_backup_file() missing backup_auto_destination configuration');
+                    }
+
+                    if (stripos($externdest, 's3://') === 0) {
+                        // Destination is AWS S3 bucket
+                        self::store_backup_file_s3($filepath, $filename, $externdest, $detailinfo[0], $courseinfo['course'][0]);
+                    } else {
+                        // Destination is filesystem directory
+                        if (is_dir($externdest) && is_writable($externdest)) {
+                            $filedest = $externdest . '/' . $filename;
+                            umask($CFG->umaskpermissions);
+                            if (copy($filepath, $filedest)) {
+                                // Expect chmod to fail if perms do not make
+                                // sense outside of data root.
+                                @chmod($filedest, $CFG->filepermissions);
+                            } else {
+                                throw new backup_helper_exception('backup_helper::store_backup_file() copy backup to backup_auto_destination failed');
+                            }
+                        } else {
+                            throw new backup_helper_exception('backup_helper::store_backup_file() invalid backup_auto_destination configuration');
+                        }
+                    }
+
+                    // At this point, have copied the backup file to
+                    // external destination. If is only destination
+                    // then leave now, returning null to indicate no
+                    // stored_file object created, otherwise drop
+                    // through to create entry in the filedir repo
+                    if ($config->backup_auto_storage == 1) {
+                        unlink($filepath);
+                        return null;
+                    }
+
+                } // $config->backup_auto_storage != 0
+
+            } // $backupmode == backup::MODE_AUTOMATED
+
+
+            // If an entry that matches this backup file's specs
+            // already exists in the filedir repo (by checking the
+            // mdl_files table), assume it is bad, and should be
+            // replaced with this new one
+            $fs = get_file_storage();
+
+            $pathnamehash = $fs->get_pathname_hash($ctxid, $component, $filearea, $itemid, '/', $filename);
+            if ($fs->file_exists_by_hash($pathnamehash)) {
+                $fs->get_file_by_hash($pathnamehash)->delete();
+            }
+
+            // Fix up a file record to put in the filedir repo
+            $stored_file = $fs->create_file_from_pathname(
+                array('contextid'   => $ctxid,
+                      'component'   => $component,
+                      'filearea'    => $filearea,
+                      'itemid'      => $itemid,
+                      'filepath'    => '/',
+                      'filename'    => $filename,
+                      'userid'      => $userid,
+                      'timecreated' => time(),
+                      'timemodified'=> time()),
+                $filepath);
+
+            // Delete file in original location, i.e. backup temp dir
+            unlink($filepath);
+
+            return $stored_file;
+
+        }
+        catch (Exception $exc)
+        {
+            // If the temp file is present make best
+            // attempt to remove it, but don't let
+            // the file removal cause a new exception
+            if (@file_exists($filepath)) {
+                @unlink($filepath);
+            }
+            // Re-throw whatever brought us here
+            throw $exc;
         }
 
-        // Backups without user info or with the anonymise functionality
-        // enabled are sent to user's "user_backup"
-        // file area. Maintenance of such area is responsibility of
-        // the user via corresponding file manager frontend
-        if ($backupmode == backup::MODE_GENERAL && (!$hasusers || $isannon)) {
-            $ctxid     = context_user::instance($userid)->id;
-            $component = 'user';
-            $filearea  = 'backup';
-            $itemid    = 0;
-        }
-
-        // Let's send the file to file storage, everything already defined
-        $fs = get_file_storage();
-        $fr = array(
-            'contextid'   => $ctxid,
-            'component'   => $component,
-            'filearea'    => $filearea,
-            'itemid'      => $itemid,
-            'filepath'    => '/',
-            'filename'    => $filename,
-            'userid'      => $userid,
-            'timecreated' => time(),
-            'timemodified'=> time());
-        // If file already exists, delete if before
-        // creating it again. This is BC behaviour - copy()
-        // overwrites by default
-        if ($fs->file_exists($fr['contextid'], $fr['component'], $fr['filearea'], $fr['itemid'], $fr['filepath'], $fr['filename'])) {
-            $pathnamehash = $fs->get_pathname_hash($fr['contextid'], $fr['component'], $fr['filearea'], $fr['itemid'], $fr['filepath'], $fr['filename']);
-            $sf = $fs->get_file_by_hash($pathnamehash);
-            $sf->delete();
-        }
-        $file = $fs->create_file_from_pathname($fr, $filepath);
-        unlink($filepath);
-        return $file;
     }
 
     /**
@@ -370,6 +419,61 @@ abstract class backup_helper {
     public static function get_inforef_itemnames() {
         return array('user', 'grouping', 'group', 'role', 'file', 'scale', 'outcome', 'grade_item', 'question_category');
     }
+
+    public static function store_backup_file_s3($filepath, $targetname, $s3url, $detailinfo, $courseinfo)
+    {   global $CFG;
+
+
+        // Strip off the leading s3://
+        $temparray      = explode('//', $s3url, 2);
+        $s3bucketpath   = array_pop($temparray);
+        // Parse to get the bucket name only,
+        // everything up to the first slash
+        $temparray      = explode('/', $s3bucketpath);
+        $s3bucketname   = array_shift($temparray);
+        if (empty($s3bucketname)) {
+            // Misconfigured, stop everything until corrected
+            throw new backup_helper_exception('backup_helper::store_backup_file() external S3 destination misconfigured');
+        }
+
+        // Parse to get the folder name only,
+        // everything after the first slash
+        $s3folder = '';
+        if (strpos($s3bucketpath, '/') !== false) {
+            $temparray  = explode('/', $s3bucketpath, 2);
+            $s3folder   = rtrim(array_pop($temparray), '/');
+            if (!empty($s3folder)) {
+                $s3folder .= '/';
+            }
+        }
+
+        require_once("{$CFG->libdir}/vendor/autoload.php");
+        $s3client = Aws\S3\S3Client::factory($CFG->aws_config);
+
+        if (!$s3client->doesBucketExist($s3bucketname)) {
+            throw new backup_helper_exception('backup_helper::store_backup_file() S3 bucket does not exist');
+        }
+
+        $s3result = $s3client->putObject(array(
+            'Bucket'        => $s3bucketname,
+            'Key'           => $s3folder . $targetname,
+            'SourceFile'    => $filepath,
+            'Metadata'      => array(
+                'moodle-course-id'      => "{$detailinfo->courseid}",
+                'moodle-course-title'   => "{$courseinfo['title']}",
+                'moodle-backup-site'    => md5(get_site_identifier()),
+                'moodle-backup-id'      => "{$detailinfo->backup_id}",
+                'moodle-backup-type'    => "{$detailinfo->type}",
+                'moodle-backup-mode'    => "{$detailinfo->mode}",
+                'moodle-backup-date'    => time())));
+
+        $s3status = $s3result['@metadata']['statusCode'];
+        if ($s3status != 200) {
+            throw new backup_helper_exception('backup_helper::store_backup_file() load backup to S3 bucket failed');
+        }
+
+    }
+
 }
 
 /*
