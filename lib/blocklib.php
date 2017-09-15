@@ -1654,6 +1654,8 @@ class block_manager {
         $mform = new $classname($editpage->url, $block, $this->page);
         $mform->set_data($block->instance);
 
+        $configsaveresult = '';
+
         if ($mform->is_cancelled()) {
             redirect($this->page->url);
 
@@ -1746,7 +1748,7 @@ class block_manager {
                 $field = substr($configfield, 7);
                 $config->$field = $value;
             }
-            $block->instance_config_save($config);
+            $configsaveresult = $block->instance_config_save($config);
 
             $bp = new stdClass;
             $bp->visible = $data->bui_visible;
@@ -1774,30 +1776,40 @@ class block_manager {
                 $DB->insert_record('block_positions', $bp);
             }
 
-            redirect($this->page->url);
-
-        } else {
-            $strheading = get_string('blockconfiga', 'moodle', $block->get_title());
-            $editpage->set_title($strheading);
-            $editpage->set_heading($strheading);
-            $bits = explode('-', $this->page->pagetype);
-            if ($bits[0] == 'tag' && !empty($this->page->subpage)) {
-                // better navbar for tag pages
-                $editpage->navbar->add(get_string('tags'), new moodle_url('/tag/'));
-                $tag = core_tag_tag::get($this->page->subpage);
-                // tag search page doesn't have subpageid
-                if ($tag) {
-                    $editpage->navbar->add($tag->get_display_name(), $tag->get_view_url());
-                }
+            if ($configsaveresult === false) {
+                $configsaveresult = get_string('unknownerror');
+            } else if ($configsaveresult === true || empty($configsaveresult)) {
+                redirect($this->page->url);
+            } else if (!is_string($configsaveresult)) {
+                $configsaveresult = get_string('unknownerror');
             }
-            $editpage->navbar->add($block->get_title());
-            $editpage->navbar->add(get_string('configuration'));
-            echo $output->header();
-            echo $output->heading($strheading, 2);
-            $mform->display();
-            echo $output->footer();
-            exit;
+
         }
+
+        $strheading = get_string('blockconfiga', 'moodle', $block->get_title());
+        $editpage->set_title($strheading);
+        $editpage->set_heading($strheading);
+        $bits = explode('-', $this->page->pagetype);
+        if ($bits[0] == 'tag' && !empty($this->page->subpage)) {
+            // better navbar for tag pages
+            $editpage->navbar->add(get_string('tags'), new moodle_url('/tag/'));
+            $tag = core_tag_tag::get($this->page->subpage);
+            // tag search page doesn't have subpageid
+            if ($tag) {
+                $editpage->navbar->add($tag->get_display_name(), $tag->get_view_url());
+            }
+        }
+        $editpage->navbar->add($block->get_title());
+        $editpage->navbar->add(get_string('configuration'));
+        echo $output->header();
+        echo $output->heading($strheading, 2);
+        if (!empty($configsaveresult)) {
+            echo $output->notification($configsaveresult, \core\output\notification::NOTIFY_ERROR);
+        }
+        $mform->display();
+        echo $output->footer();
+        exit;
+
     }
 
     /**
