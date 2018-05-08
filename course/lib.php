@@ -1423,21 +1423,19 @@ function course_module_update_calendar_events($modulename, $instance = null, $cm
 function course_module_bulk_update_calendar_events($modulename, $courseid = 0) {
     global $DB;
 
-    $instances = null;
-    if ($courseid) {
-        if (!$instances = $DB->get_records($modulename, array('course' => $courseid))) {
-            return false;
-        }
-    } else {
-        if (!$instances = $DB->get_records($modulename)) {
-            return false;
-        }
+    $where = $courseid ? array('course' => $courseid) : null;
+    if (!($idrecords = $DB->get_records($modulename, $where, '', 'id'))) {
+        return false;
     }
 
-    foreach ($instances as $instance) {
-        if ($cm = get_coursemodule_from_instance($modulename, $instance->id, $instance->course)) {
-            course_module_calendar_event_update_process($instance, $cm);
+    foreach ($idrecords as $idrecord) {
+        if (!($instance = $DB->get_record($modulename, array('id' => $idrecord->id)))) {
+            continue;
         }
+        if (!($cm = get_coursemodule_from_instance($modulename, $instance->id, $instance->course))) {
+            continue;
+        }
+        course_module_calendar_event_update_process($instance, $cm);
     }
     return true;
 }
