@@ -26,6 +26,9 @@ namespace logstore_standard\task;
 
 defined('MOODLE_INTERNAL') || die();
 
+/**
+ * Class containing functions for delete logstore cron task.
+ */
 class cleanup_task extends \core\task\scheduled_task {
 
     /**
@@ -45,27 +48,40 @@ class cleanup_task extends \core\task\scheduled_task {
         global $DB;
 
         $loglifetime = (int)get_config('logstore_standard', 'loglifetime');
-
         if (empty($loglifetime) || $loglifetime < 0) {
             return;
         }
 
         $loglifetime = time() - ($loglifetime * 3600 * 24); // Value in days.
-        $lifetimep = array($loglifetime);
+        $lifetimep = [$loglifetime];
         $start = time();
+        $querylimit = 131072;
+        $recordstodelete = true;
 
-        while ($min = $DB->get_field_select("logstore_standard_log", "MIN(timecreated)", "timecreated < ?", $lifetimep)) {
-            // Break this down into chunks to avoid transaction for too long and generally thrashing database.
-            // Experiments suggest deleting one day takes up to a few seconds; probably a reasonable chunk size usually.
-            // If the cleanup has just been enabled, it might take e.g a month to clean the years of logs.
-            $params = array(min($min + 3600 * 24, $loglifetime));
-            $DB->delete_records_select("logstore_standard_log", "timecreated < ?", $params);
+        while ($recordstodelete) {
+            $deletebatch = $DB->get_records_select(
+                "logstore_standard_log",
+                "timecreated < ?",
+                $lifetimep,
+                "",
+                "id",
+                0,
+                $querylimit);
+            if (!$deletebatch) {
+                $recordstodelete = false; // Break out if no records match the delete criteria.
+                break;
+            }
+            // Need helper DB function for final delete, delete_records doesn't have explicit limit keyword.
+            $deletebatchlist = array_keys($deletebatch);
+            list($insql, $inparams) = $DB->get_in_or_equal($deletebatchlist, SQL_PARAMS_NAMED);
+            $DB->delete_records_select('logstore_standard_log', "id $insql", $inparams);
+
             if (time() > $start + 300) {
                 // Do not churn on log deletion for too long each run.
+                mtrace(" Delete records timeout has been reached, will resume at next scheduled run!");
                 break;
             }
         }
-
         mtrace(" Deleted old log records from standard store.");
     }
 }
